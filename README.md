@@ -46,6 +46,7 @@ snapshot read-only at runtime and comply with that model's license.
 | Main KV cache | BF16 |
 | Native MTP depth | 2 |
 | Observed KV pool at GPU utilization 0.85 | 692,291-721,258 tokens |
+| Cold 100K effective prefill | 1,664 tok/s (100,086 tokens / 60.15 s TTFT) |
 | Short-run C1 raw output decode | 34.4-37.2 tok/s |
 | Corrected C1 visible-code decode | 25.9-27.4 tok/s |
 | Sustained C4 aggregate decode | 52.89 tok/s |
