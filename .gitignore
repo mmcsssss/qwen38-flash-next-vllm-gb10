@@ -1,0 +1,4 @@
+*.oci/
+*.oci.tar
+*.building-*
+__pycache__/

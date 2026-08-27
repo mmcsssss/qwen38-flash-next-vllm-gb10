@@ -1,0 +1,1323 @@
+diff --git a/tests/v1/executor/test_executor.py b/tests/v1/executor/test_executor.py
+index a21a8dafd3..e3b77459e7 100644
+--- a/tests/v1/executor/test_executor.py
++++ b/tests/v1/executor/test_executor.py
+@@ -5,6 +5,7 @@ import asyncio
+ import os
+ from collections.abc import Callable
+ from concurrent.futures import Future
++from types import SimpleNamespace
+ from typing import Any
+ 
+ import pytest
+@@ -16,6 +17,7 @@ from vllm.sampling_params import SamplingParams
+ from vllm.v1.engine.async_llm import AsyncLLM
+ from vllm.v1.engine.llm_engine import LLMEngine
+ from vllm.v1.executor import multiproc_executor as multiproc_executor_module
++from vllm.v1.executor import uniproc_executor as uniproc_executor_module
+ from vllm.v1.executor.abstract import Executor
+ from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+ from vllm.v1.executor.uniproc_executor import (
+@@ -45,6 +47,52 @@ def test_supports_async_scheduling_multiproc_executor():
+     assert MultiprocExecutor.supports_async_scheduling() is True
+ 
+ 
++def test_uniproc_executor_starts_ple_worker_around_model_load(monkeypatch):
++    events = []
++
++    class FakeWorker:
++        def __init__(self, rpc_rank):
++            assert rpc_rank == 0
++
++        def init_worker(self, all_kwargs):
++            events.append("init_worker")
++
++        def init_device(self):
++            events.append("init_device")
++
++        def spawn_ple_offload(self):
++            events.append("spawn_ple_offload")
++
++        def load_model(self):
++            events.append("load_model")
++
++        def wait_ple_offload_ready(self):
++            events.append("wait_ple_offload_ready")
++
++    monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "1")
++    monkeypatch.setenv("VLLM_ELASTIC_EP_SCALE_UP_LAUNCH", "0")
++    monkeypatch.setattr(uniproc_executor_module, "WorkerWrapperBase", FakeWorker)
++    monkeypatch.setattr(uniproc_executor_module, "set_worker_net_device", lambda *_: None)
++    monkeypatch.setattr(
++        uniproc_executor_module.current_platform,
++        "update_block_size_for_backend",
++        lambda *_: None,
++    )
++
++    executor = UniProcExecutor.__new__(UniProcExecutor)
++    executor.vllm_config = SimpleNamespace()
++    monkeypatch.setattr(executor, "_distributed_args", lambda: ("file://test", 0, 0))
++    executor._init_executor()
++
++    assert events == [
++        "init_worker",
++        "init_device",
++        "spawn_ple_offload",
++        "load_model",
++        "wait_ple_offload_ready",
++    ]
++
++
+ class _FakeClock:
+     def __init__(self) -> None:
+         self.now = 0.0
+diff --git a/tests/v1/worker/test_ple_offload_worker.py b/tests/v1/worker/test_ple_offload_worker.py
+index b22316a68d..1461bbd93b 100644
+--- a/tests/v1/worker/test_ple_offload_worker.py
++++ b/tests/v1/worker/test_ple_offload_worker.py
+@@ -621,6 +621,24 @@ def test_ple_offload_runner_routes_requests_layer_first(
+         torch.tensor([[20, 20]], dtype=torch.int32),
+     )
+ 
++def test_parse_ple_cpu_affinity() -> None:
++    assert ple_offload_worker._parse_cpu_affinity("5-9,15,17-19") == {
++        5,
++        6,
++        7,
++        8,
++        9,
++        15,
++        17,
++        18,
++        19,
++    }
++
++
++def test_parse_ple_cpu_affinity_rejects_descending_range() -> None:
++    with pytest.raises(ValueError, match="descending"):
++        ple_offload_worker._parse_cpu_affinity("9-5")
++
+ 
+ def test_wait_for_ready_closes_pipe() -> None:
+     context = ple_offload_worker.get_mp_context()
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 6ee337f14e..0c75d1fe95 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -291,6 +291,8 @@ if TYPE_CHECKING:
+     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
+     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
+     VLLM_PLE_CPU_OFFLOAD: bool = False
++    VLLM_PLE_SSD_OFFLOAD: bool = False
++    VLLM_PLE_SSD_DROP_CACHE: bool = False
+     VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
+     VLLM_LOG_MODEL_INSPECTION: bool = False
+     VLLM_DEBUG_MFU_METRICS: bool = False
+@@ -2036,6 +2038,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_PLE_CPU_OFFLOAD": lambda: (
+         os.getenv("VLLM_PLE_CPU_OFFLOAD", "False").lower() in ("true", "1")
+     ),
++    # Keep large position-learning enhancement (PLE) embedding shards in their
++    # existing safetensors files and fault in only rows requested by the CPU
++    # offload worker. This requires VLLM_PLE_CPU_OFFLOAD.
++    "VLLM_PLE_SSD_OFFLOAD": lambda: (
++        os.getenv("VLLM_PLE_SSD_OFFLOAD", "False").lower() in ("true", "1")
++    ),
++    # Drop mapped PLE file pages after every lookup. Linux normally reclaims
++    # page cache under pressure; this stricter mode trades warm-hit speed for a
++    # lower resident-page footprint on memory-constrained unified-memory hosts.
++    "VLLM_PLE_SSD_DROP_CACHE": lambda: (
++        os.getenv("VLLM_PLE_SSD_DROP_CACHE", "False").lower() in ("true", "1")
++    ),
+     # Timeout for PLE weight loading and TP worker registration.
+     "VLLM_PLE_OFFLOAD_READY_TIMEOUT": lambda: float(
+         os.getenv("VLLM_PLE_OFFLOAD_READY_TIMEOUT", "600")
+diff --git a/vllm/model_executor/layers/fused_moe/routed_experts.py b/vllm/model_executor/layers/fused_moe/routed_experts.py
+index 41ef202135..ace62a06da 100644
+--- a/vllm/model_executor/layers/fused_moe/routed_experts.py
++++ b/vllm/model_executor/layers/fused_moe/routed_experts.py
+@@ -313,6 +313,21 @@ class RoutedExperts(PluggableLayer):
+         expert_id: int,
+     ):
+         param_data = param.data
++        loaded_values = loaded_weight.reshape(-1)
++        if loaded_values.numel() > 1:
++            if self.moe_config.ep_size != 1:
++                raise ValueError("Batched expert scales require expert parallel size 1")
++            end_expert = expert_id + loaded_values.numel()
++            if end_expert > param_data.shape[0]:
++                raise ValueError("Batched expert scale range exceeds parameter size")
++            loaded_values = loaded_values.to(param_data.device)
++            if shard_id in ("w1", "w3"):
++                idx = 0 if shard_id == "w1" else 1
++                param_data[expert_id:end_expert, idx].copy_(loaded_values)
++            elif shard_id == "w2":
++                param_data[expert_id:end_expert].copy_(loaded_values)
++            return
++
+         # for per tensor weight quantization
+         if shard_id in ("w1", "w3"):
+             # We have to keep the weight scales of w1 and w3 because
+@@ -704,6 +719,33 @@ class RoutedExperts(PluggableLayer):
+             # this is needed for compressed-tensors only
+             loaded_weight = loaded_weight.to(param.data.device)
+ 
++            if "ModelOpt" in quant_method_name and loaded_weight.numel() > 1:
++                if self.moe_config.ep_size != 1:
++                    raise ValueError(
++                        "Batched expert input scales require expert parallel size 1"
++                    )
++                scale_expert_id = (
++                    global_expert_id if use_global_sf else expert_id
++                )
++                loaded_values = loaded_weight.reshape(-1)
++                end_expert = scale_expert_id + loaded_values.numel()
++                if end_expert > param.data.shape[0]:
++                    raise ValueError(
++                        "Batched expert input scale range exceeds parameter size"
++                    )
++                if param.data.ndim == 2 and shard_id in ("w1", "w3"):
++                    scale_shard_id = 0 if shard_id == "w1" else 1
++                    param.data[
++                        scale_expert_id:end_expert, scale_shard_id
++                    ].copy_(loaded_values)
++                elif param.data.ndim == 1 and shard_id == "w2":
++                    param.data[scale_expert_id:end_expert].copy_(loaded_values)
++                else:
++                    raise ValueError(
++                        "Unsupported parameter shape for batched expert input scales"
++                    )
++                return True if return_success else None
++
+             # ModelOpt NVFP4 stores w13 input scales as two logical shards.
+             # The generic assignment below would broadcast w1/w3 into the
+             # whole expert row, so the second shard would overwrite the first.
+diff --git a/vllm/model_executor/model_loader/default_loader.py b/vllm/model_executor/model_loader/default_loader.py
+index 039a577f80..e565048de2 100644
+--- a/vllm/model_executor/model_loader/default_loader.py
++++ b/vllm/model_executor/model_loader/default_loader.py
+@@ -4,13 +4,14 @@ import dataclasses
+ import glob
+ import os
+ import time
+-from collections.abc import Generator, Iterable
++from collections.abc import Callable, Generator, Iterable
+ from typing import cast
+ 
+ import torch
+ from torch import nn
+ from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
+ 
++from vllm import envs
+ from vllm.config import ModelConfig
+ from vllm.config.load import LoadConfig
+ from vllm.logger import init_logger
+@@ -242,7 +243,9 @@ class DefaultModelLoader(BaseModelLoader):
+         return hf_folder, hf_weights_files, use_safetensors
+ 
+     def _get_weights_iterator(
+-        self, source: "Source"
++        self,
++        source: "Source",
++        weight_name_filter: Callable[[str], bool] | None = None,
+     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+         """Get an iterator for the model weights based on the load format."""
+         extra_config = self.load_config.model_loader_extra_config
+@@ -253,6 +256,24 @@ class DefaultModelLoader(BaseModelLoader):
+             source.fall_back_to_pt,
+             source.allow_patterns_overrides,
+         )
++        if envs.VLLM_PLE_SSD_OFFLOAD:
++            extra_config = self.load_config.model_loader_extra_config
++            strategy = self.load_config.safetensors_load_strategy
++            if not use_safetensors:
++                raise ValueError("PLE SSD offload requires safetensors weights")
++            if self.load_config.load_format in (
++                "fastsafetensors",
++                "instanttensor",
++            ) or extra_config.get("enable_multithread_load"):
++                raise ValueError(
++                    "PLE SSD offload requires the standard single-threaded "
++                    "safetensors loader so PLE rows can be skipped before read"
++                )
++            if strategy not in (None, "lazy"):
++                raise ValueError(
++                    "PLE SSD offload requires safetensors_load_strategy='lazy', "
++                    f"got {strategy!r}"
++                )
+         if self.load_config.load_format == "npcache":
+             # Currently np_cache only support *.bin checkpoints
+             assert use_safetensors is False
+@@ -284,6 +305,11 @@ class DefaultModelLoader(BaseModelLoader):
+                         ),
+                     )
+                 else:
++                    source_filter = None
++                    if weight_name_filter is not None:
++                        source_filter = lambda name: weight_name_filter(
++                            source.prefix + name
++                        )
+                     weights_iterator = safetensors_weights_iterator(
+                         hf_weights_files,
+                         self.load_config.use_tqdm_on_load,
+@@ -295,6 +321,7 @@ class DefaultModelLoader(BaseModelLoader):
+                         safetensors_prefetch_block_size=(
+                             self.load_config.safetensors_prefetch_block_size
+                         ),
++                        weight_name_filter=source_filter,
+                     )
+         else:
+             if extra_config.get("enable_multithread_load"):
+@@ -316,12 +343,22 @@ class DefaultModelLoader(BaseModelLoader):
+         if self.counter_before_loading_weights == 0.0:
+             self.counter_before_loading_weights = time.perf_counter()
+         # Apply the prefix.
+-        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
++        prefixed_weights = (
++            (source.prefix + name, tensor) for (name, tensor) in weights_iterator
++        )
++        if weight_name_filter is None:
++            return prefixed_weights
++        return (
++            (name, tensor)
++            for name, tensor in prefixed_weights
++            if weight_name_filter(name)
++        )
+ 
+     def get_all_weights(
+         self,
+         model_config: ModelConfig,
+         model: nn.Module,
++        weight_name_filter: Callable[[str], bool] | None = None,
+     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+         primary_weights = DefaultModelLoader.Source(
+             model_config.model,
+@@ -330,14 +367,14 @@ class DefaultModelLoader(BaseModelLoader):
+             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
+             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
+         )
+-        yield from self._get_weights_iterator(primary_weights)
++        yield from self._get_weights_iterator(primary_weights, weight_name_filter)
+ 
+         secondary_weights = cast(
+             Iterable[DefaultModelLoader.Source],
+             getattr(model, "secondary_weights", ()),
+         )
+         for source in secondary_weights:
+-            yield from self._get_weights_iterator(source)
++            yield from self._get_weights_iterator(source, weight_name_filter)
+ 
+     def download_model(self, model_config: ModelConfig) -> None:
+         self._prepare_weights(
+diff --git a/vllm/model_executor/model_loader/weight_utils.py b/vllm/model_executor/model_loader/weight_utils.py
+index 60cbfb4ee2..8f119cbce4 100644
+--- a/vllm/model_executor/model_loader/weight_utils.py
++++ b/vllm/model_executor/model_loader/weight_utils.py
+@@ -81,6 +81,33 @@ def enable_xet_high_performance():
+ enable_xet_high_performance()
+ 
+ 
++def should_skip_ple_ssd_weight(weight_name: str) -> bool:
++    """Skip file-backed PLE shard tensors before safetensors materialization."""
++    return (
++        envs.VLLM_PLE_SSD_OFFLOAD
++        and ".ple_embedding.ngram_embedding.shard_" in weight_name
++        and weight_name.endswith(".weight")
++    )
++
++
++_QWEN38_EXPERT_SCALAR_PATTERN = re.compile(
++    r"^(?P<prefix>.+\.experts\.)(?P<expert_id>\d+)"
++    r"(?P<suffix>\.(?:down_proj|gate_proj|up_proj)\."
++    r"(?:input_scale|weight_scale_2))$"
++)
++
++
++def _qwen38_expert_scalar_key(weight_name: str) -> tuple[str, int, str] | None:
++    match = _QWEN38_EXPERT_SCALAR_PATTERN.match(weight_name)
++    if match is None:
++        return None
++    return (
++        match.group("prefix"),
++        int(match.group("expert_id")),
++        match.group("suffix"),
++    )
++
++
+ class DisabledTqdm(tqdm):
+     def __init__(self, *args, **kwargs):
+         kwargs["disable"] = True
+@@ -840,6 +867,7 @@ def safetensors_weights_iterator(
+     *,
+     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
+     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
++    weight_name_filter: Callable[[str], bool] | None = None,
+ ) -> Generator[tuple[str, torch.Tensor], None, None]:
+     """Iterate over the weights in the model safetensor files.
+ 
+@@ -919,6 +947,24 @@ def safetensors_weights_iterator(
+             block_size=safetensors_prefetch_block_size,
+         )
+ 
++    def skip_name(name: str) -> bool:
++        return (
++            should_skip_weight(name, local_expert_ids)
++            or should_skip_ple_ssd_weight(name)
++            or (weight_name_filter is not None and not weight_name_filter(name))
++        )
++
++    profile_load = os.getenv("QWEN38_PROFILE_WEIGHT_LOADING") == "1"
++    profile_fetch_s = 0.0
++    profile_downstream_s = 0.0
++    profile_tensor_count = 0
++    coalesce_expert_scalars = (
++        os.getenv("QWEN38_COALESCE_EXPERT_SCALARS") == "1"
++        and not is_offload_process()
++    )
++    coalesced_source_tensors = 0
++    coalesced_batches = 0
++
+     leftover_state_dict: dict[str, torch.Tensor] = {}
+     for st_file in tqdm(
+         sorted_files,
+@@ -930,11 +976,10 @@ def safetensors_weights_iterator(
+             with open(st_file, "rb") as f:
+                 state_dict = load(f.read())
+             for name, param in state_dict.items():
+-                if not should_skip_weight(name, local_expert_ids):
++                if not skip_name(name):
+                     yield name, param
+         elif safetensors_load_strategy == "torchao":
+-            # we can't load flattened torchao tensor subclasses directly into the model
+-            # instead we reconstruct the subclasses here before returning
++            # TorchAO tensor subclasses must be reconstructed before loading.
+             if not torchao_version_at_least("0.15.0"):
+                 raise ValueError(
+                     "Please use torchao version >= 0.15.0 "
+@@ -947,28 +992,79 @@ def safetensors_weights_iterator(
+             with safe_open(st_file, framework="pt") as f:
+                 state_dict = {}
+                 for name in f.keys():  # noqa: SIM118
+-                    if should_skip_weight(name, local_expert_ids):
++                    if skip_name(name):
+                         continue
+                     state_dict[name] = f.get_tensor(name)
+ 
+-                # update with leftover tensor data from previous iteration, if any
++                # Sharded checkpoints may split tensor-subclass state.
+                 state_dict.update(leftover_state_dict)
+                 metadata = f.metadata()
+-                # due to sharded checkpoints, we are not guaranteed that we have all
+-                # tensor subclass data on one file
+-                # state_dict has the leftover data from this step and we wait for
+-                # missing information to be provided in a future iteration
+                 unflattened_state_dict, leftover_state_dict = (
+                     unflatten_tensor_state_dict(state_dict, metadata)
+                 )
+             yield from unflattened_state_dict.items()
+         else:
+             with safe_open(st_file, framework="pt") as f:
++                scalar_groups: dict[
++                    tuple[str, str], list[tuple[int, str]]
++                ] = defaultdict(list)
+                 for name in f.keys():  # noqa: SIM118
+-                    if should_skip_weight(name, local_expert_ids):
++                    if skip_name(name):
++                        continue
++                    scalar_key = (
++                        _qwen38_expert_scalar_key(name)
++                        if coalesce_expert_scalars
++                        else None
++                    )
++                    if scalar_key is not None:
++                        prefix, expert_id, suffix = scalar_key
++                        scalar_groups[(prefix, suffix)].append((expert_id, name))
+                         continue
++                    fetch_started = time.perf_counter() if profile_load else 0.0
+                     param = f.get_tensor(name)
++                    if profile_load:
++                        profile_fetch_s += time.perf_counter() - fetch_started
++                        profile_tensor_count += 1
++                        downstream_started = time.perf_counter()
+                     yield name, param
++                    if profile_load:
++                        profile_downstream_s += time.perf_counter() - downstream_started
++
++                for (prefix, suffix), entries in scalar_groups.items():
++                    entries.sort()
++                    first_expert = entries[0][0]
++                    expected_ids = range(first_expert, first_expert + len(entries))
++                    actual_ids = [expert_id for expert_id, _ in entries]
++                    if actual_ids != list(expected_ids):
++                        for _, name in entries:
++                            param = f.get_tensor(name)
++                            yield name, param
++                        continue
++
++                    fetch_started = time.perf_counter() if profile_load else 0.0
++                    values = torch.stack(
++                        [f.get_tensor(name).reshape(()) for _, name in entries]
++                    )
++                    if profile_load:
++                        profile_fetch_s += time.perf_counter() - fetch_started
++                        profile_tensor_count += len(entries)
++                        downstream_started = time.perf_counter()
++                    yield f"{prefix}{first_expert}{suffix}", values
++                    coalesced_source_tensors += len(entries)
++                    coalesced_batches += 1
++                    if profile_load:
++                        profile_downstream_s += time.perf_counter() - downstream_started
++
++    if profile_load:
++        logger.info(
++            "Safetensors load profile: tensors=%d, fetch=%.3fs, "
++            "downstream-load=%.3fs, coalesced=%d source tensors into %d batches",
++            profile_tensor_count,
++            profile_fetch_s,
++            profile_downstream_s,
++            coalesced_source_tensors,
++            coalesced_batches,
++        )
+ 
+ 
+ def multi_thread_safetensors_weights_iterator(
+diff --git a/vllm/models/qwen4_exp/nvidia/ple_layer.py b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+index 5f9c6f28b8..abfde79e82 100644
+--- a/vllm/models/qwen4_exp/nvidia/ple_layer.py
++++ b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+@@ -23,6 +23,7 @@ from vllm.model_executor.layers.ple_offload_layer import (
+     PleOffloadLayer,
+     is_offload_process,
+ )
++from vllm.model_executor.layers.ple_ssd_store import SsdBackedPleEmbedding
+ from vllm.model_executor.layers.quantization.base_config import (
+     QuantizationConfig,
+     QuantizeMethodBase,
+@@ -279,16 +280,27 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
+         )
+         divisor = int(config.make_ngram_vocab_size_divisible_by)
+         padded_vocab_size = ((offset + divisor - 1) // divisor) * divisor
+-        self.ngram_embedding = VocabParallelEmbedding(
+-            padded_vocab_size,
+-            self.head_dim,
+-            params_dtype=params_dtype,
+-            padding_size=divisor,
+-            prefix=f"{prefix}.ngram_embedding",
+-            quant_method=_get_ple_embedding_quant_method(
+-                quant_config, f"{prefix}.ngram_embedding"
+-            ),
+-        )
++        if envs.VLLM_PLE_SSD_OFFLOAD:
++            if not envs.VLLM_PLE_CPU_OFFLOAD:
++                raise ValueError(
++                    "VLLM_PLE_SSD_OFFLOAD requires VLLM_PLE_CPU_OFFLOAD=1"
++                )
++            self.ngram_embedding: nn.Module = SsdBackedPleEmbedding(
++                padded_vocab_size,
++                self.head_dim,
++                self.split_ngram_parts,
++            )
++        else:
++            self.ngram_embedding = VocabParallelEmbedding(
++                padded_vocab_size,
++                self.head_dim,
++                params_dtype=params_dtype,
++                padding_size=divisor,
++                prefix=f"{prefix}.ngram_embedding",
++                quant_method=_get_ple_embedding_quant_method(
++                    quant_config, f"{prefix}.ngram_embedding"
++                ),
++            )
+         self.register_buffer(
+             "positions_buffer",
+             torch.arange(max_total_tokens, dtype=torch.int64),
+@@ -428,18 +440,28 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
+         ngram_ids = torch.cat(id_blocks, dim=-1)
+         if output_buffer is not None:
+             output = output_buffer[:num_tokens, : self.embedding_dim]
+-            torch.index_select(
+-                self.ngram_embedding.weight,
+-                0,
+-                ngram_ids.reshape(-1),
+-                out=output.reshape(-1, self.head_dim),
+-            )
++            if isinstance(self.ngram_embedding, SsdBackedPleEmbedding):
++                self.ngram_embedding.lookup(
++                    ngram_ids.reshape(-1),
++                    out=output.reshape(-1, self.head_dim),
++                )
++            else:
++                torch.index_select(
++                    self.ngram_embedding.weight,
++                    0,
++                    ngram_ids.reshape(-1),
++                    out=output.reshape(-1, self.head_dim),
++                )
+             return output
++        if isinstance(self.ngram_embedding, SsdBackedPleEmbedding):
++            raise RuntimeError("PLE SSD lookup requires the offload output buffer")
+         return self.ngram_embedding(ngram_ids).flatten(-2)
+ 
+     def get_offload_output_dtype(self, default_dtype: torch.dtype) -> torch.dtype:
+         """Keep quantized lookup results in their embedding storage dtype."""
+         embedding = getattr(self, "ngram_embedding", None)
++        if isinstance(embedding, SsdBackedPleEmbedding):
++            return embedding.storage_dtype
+         weight = getattr(embedding, "weight", None)
+         if weight is not None:
+             return weight.dtype
+@@ -447,6 +469,29 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
+             return torch.float8_e4m3fn
+         return default_dtype
+ 
++    def setup_ssd_backing(
++        self,
++        checkpoint_dir: str,
++        layer_name: str,
++        mapper: object | None,
++    ) -> None:
++        """Attach checkpoint files after the CPU model hierarchy is discovered."""
++        if not isinstance(self.ngram_embedding, SsdBackedPleEmbedding):
++            raise RuntimeError(f"PLE layer {layer_name} is not configured for SSD offload")
++
++        def map_name(name: str) -> str | None:
++            if mapper is None:
++                return name
++            mapped = mapper.apply_list([name])  # type: ignore[attr-defined]
++            return mapped[0] if mapped else None
++
++        self.ngram_embedding.configure(
++            checkpoint_dir,
++            layer_name,
++            name_mapper=map_name,
++            drop_cache=envs.VLLM_PLE_SSD_DROP_CACHE,
++        )
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         """Load hash buffers and checkpoint-split embedding rows."""
+ 
+diff --git a/vllm/v1/executor/uniproc_executor.py b/vllm/v1/executor/uniproc_executor.py
+index da1f2c588b..439a10e601 100644
+--- a/vllm/v1/executor/uniproc_executor.py
++++ b/vllm/v1/executor/uniproc_executor.py
+@@ -67,11 +67,15 @@ class UniProcExecutor(Executor):
+ 
+         self.driver_worker.init_worker(all_kwargs=[kwargs])
+         self.driver_worker.init_device()
++        if envs.VLLM_PLE_CPU_OFFLOAD:
++            self.driver_worker.spawn_ple_offload()
+ 
+         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+             self.driver_worker.elastic_ep_execute("load_model")
+         else:
+             self.driver_worker.load_model()
++        if envs.VLLM_PLE_CPU_OFFLOAD:
++            self.driver_worker.wait_ple_offload_ready()
+         current_platform.update_block_size_for_backend(self.vllm_config)
+ 
+     def _distributed_args(self) -> tuple[str, int, int]:
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index e86aeab06d..aaeebb8c34 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -21,6 +21,7 @@ Class structure mirrors the GPU worker pattern in multiproc_executor.py:
+ 
+ import contextlib
+ import multiprocessing.process
++import os
+ import pickle
+ import signal
+ import tempfile
+@@ -66,6 +67,44 @@ from vllm.v1.ple_offload.protocol import (
+ logger = init_logger(__name__)
+ 
+ 
++def _parse_cpu_affinity(value: str) -> set[int]:
++    """Parse Linux CPU-list syntax such as ``5-9,15-19``."""
++    cpus: set[int] = set()
++    for item in value.split(","):
++        item = item.strip()
++        if not item:
++            continue
++        if "-" not in item:
++            cpus.add(int(item))
++            continue
++        start_text, end_text = item.split("-", 1)
++        start = int(start_text)
++        end = int(end_text)
++        if end < start:
++            raise ValueError(f"Invalid descending CPU range: {item}")
++        cpus.update(range(start, end + 1))
++    if not cpus:
++        raise ValueError("CPU affinity list is empty")
++    return cpus
++
++
++def _configure_cpu_worker() -> None:
++    """Apply optional CPU placement before PyTorch creates worker threads."""
++    affinity_text = os.getenv("QWEN38_PLE_CPU_AFFINITY", "").strip()
++    if affinity_text:
++        if not hasattr(os, "sched_setaffinity"):
++            raise RuntimeError("QWEN38_PLE_CPU_AFFINITY requires Linux affinity APIs")
++        affinity = _parse_cpu_affinity(affinity_text)
++        available = os.sched_getaffinity(0)
++        if not affinity.issubset(available):
++            raise ValueError(
++                "QWEN38_PLE_CPU_AFFINITY requests unavailable CPUs: "
++                f"requested={sorted(affinity)}, available={sorted(available)}"
++            )
++        os.sched_setaffinity(0, affinity)
++        logger.info("Pinned PLE worker to CPU(s): %s", sorted(affinity))
++
++
+ @dataclass
+ class PleOffloadOutputTarget:
+     """GPU output destination and semaphore for one TP worker."""
+@@ -245,6 +284,7 @@ class PleOffloadWorker:
+     ) -> None:
+         """Load PLE weights, accept registrations, and run the request loop."""
+         decorate_logs("PleOffloadWorker")
++        _configure_cpu_worker()
+         ready_reader, ready_writer = ready_pipe
+         ready_reader.close()
+         shutdown_event = threading.Event()
+@@ -411,6 +451,15 @@ class PleOffloadRunner:
+                     matched_checkpoint_tensors += 1
+                     yield weight_name, tensor
+ 
++        def is_offload_checkpoint_weight(weight_name: str) -> bool:
++            mapped_name: str | None = weight_name
++            if mapper is not None:
++                mapped_names = mapper.apply_list([weight_name])
++                mapped_name = mapped_names[0] if mapped_names else None
++            return mapped_name is not None and mapped_name.startswith(
++                offload_prefixes
++            )
++
+         loader = get_model_loader(load_config)
+         if isinstance(loader, DummyModelLoader):
+             logger.info(
+@@ -420,7 +469,28 @@ class PleOffloadRunner:
+             for layer in offload_layers.values():
+                 initialize_dummy_weights(layer, model_config)
+         elif isinstance(loader, DefaultModelLoader):
+-            all_weights = loader.get_all_weights(model_config, model)
++            if envs.VLLM_PLE_SSD_OFFLOAD:
++                hf_folder, _, use_safetensors = loader._prepare_weights(
++                    model_config.model,
++                    None,
++                    model_config.revision,
++                    getattr(model, "fall_back_to_pt_during_load", True),
++                    getattr(model, "allow_patterns_overrides", None),
++                )
++                if not use_safetensors:
++                    raise ValueError("PLE SSD offload requires safetensors weights")
++                for layer_name, layer in offload_layers.items():
++                    setup_ssd_backing = getattr(layer, "setup_ssd_backing", None)
++                    if not callable(setup_ssd_backing):
++                        raise TypeError(
++                            f"PLE layer {layer_name} does not support SSD offload"
++                        )
++                    setup_ssd_backing(hf_folder, layer_name, mapper)
++            all_weights = loader.get_all_weights(
++                model_config,
++                model,
++                weight_name_filter=is_offload_checkpoint_weight,
++            )
+             loaded_params = model.load_weights(offload_only_iter(all_weights))
+             if matched_checkpoint_tensors == 0:
+                 raise RuntimeError(
+diff --git a/tests/models/qwen4_exp/test_ple_ssd_store.py b/tests/models/qwen4_exp/test_ple_ssd_store.py
+new file mode 100644
+index 0000000000..4339728d0c
+--- /dev/null
++++ b/tests/models/qwen4_exp/test_ple_ssd_store.py
+@@ -0,0 +1,165 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import json
++from pathlib import Path
++
++import pytest
++import torch
++from safetensors.torch import save_file
++
++from vllm.model_executor.layers.ple_ssd_store import (
++    SafetensorsPleStore,
++    SsdBackedPleEmbedding,
++)
++from vllm.model_executor.model_loader import weight_utils
++
++
++def _write_checkpoint(
++    directory: Path,
++    shards: list[torch.Tensor],
++    *,
++    checkpoint_prefix: str = "checkpoint.ple",
++) -> list[str]:
++    weight_map: dict[str, str] = {}
++    names = []
++    for index, shard in enumerate(shards):
++        name = f"{checkpoint_prefix}.ngram_embedding.shard_{index}.weight"
++        filename = f"ple-{index}.safetensors"
++        save_file({name: shard.contiguous()}, directory / filename)
++        weight_map[name] = filename
++        names.append(name)
++    (directory / "model.safetensors.index.json").write_text(
++        json.dumps({"metadata": {}, "weight_map": weight_map}),
++        encoding="utf-8",
++    )
++    return names
++
++
++def _map_checkpoint_name(name: str) -> str:
++    return name.removeprefix("checkpoint.")
++
++
++def test_ple_ssd_store_preserves_random_row_order_across_shards(
++    tmp_path: Path,
++) -> None:
++    shard_0 = torch.tensor(
++        [[1.0, 2.0], [4.0, 8.0], [16.0, 32.0], [64.0, 128.0]]
++    ).to(torch.float8_e4m3fn)
++    shard_1 = torch.tensor([[0.5, 1.0], [2.0, 4.0], [8.0, 16.0]]).to(
++        torch.float8_e4m3fn
++    )
++    _write_checkpoint(tmp_path, [shard_0, shard_1])
++    store = SafetensorsPleStore(
++        tmp_path,
++        "ple",
++        expected_parts=2,
++        expected_vocab_size=7,
++        expected_width=2,
++        name_mapper=_map_checkpoint_name,
++    )
++    indices = torch.tensor([6, 0, 4, 3, 6, 1])
++    output = torch.empty(6, 2, dtype=torch.float8_e4m3fn, pin_memory=False)
++
++    result = store.lookup(indices, out=output)
++
++    expected = torch.cat((shard_0, shard_1), dim=0).index_select(0, indices)
++    assert result.data_ptr() == output.data_ptr()
++    assert torch.equal(result.view(torch.uint8), expected.view(torch.uint8))
++    assert store.mapped_bytes == shard_0.numel() + shard_1.numel()
++
++
++def test_ple_ssd_store_precise_cache_drop_preserves_rows(tmp_path: Path) -> None:
++    shards = [
++        torch.arange(16, dtype=torch.uint8).reshape(4, 4).view(torch.float8_e4m3fn),
++        torch.arange(16, 32, dtype=torch.uint8)
++        .reshape(4, 4)
++        .view(torch.float8_e4m3fn),
++    ]
++    _write_checkpoint(tmp_path, shards)
++    store = SafetensorsPleStore(
++        tmp_path,
++        "ple",
++        expected_parts=2,
++        expected_vocab_size=8,
++        expected_width=4,
++        name_mapper=_map_checkpoint_name,
++        drop_cache=True,
++    )
++    indices = torch.tensor([7, 1, 4, 0, 7])
++
++    result = store.lookup(indices)
++
++    expected = torch.cat(shards).index_select(0, indices)
++    assert torch.equal(result.view(torch.uint8), expected.view(torch.uint8))
++
++
++def test_ple_ssd_store_rejects_missing_shard(tmp_path: Path) -> None:
++    shard = torch.zeros(2, 2, dtype=torch.float8_e4m3fn)
++    _write_checkpoint(tmp_path, [shard])
++
++    with pytest.raises(ValueError, match=r"missing=\[1\]"):
++        SafetensorsPleStore(
++            tmp_path,
++            "ple",
++            expected_parts=2,
++            expected_vocab_size=4,
++            expected_width=2,
++            name_mapper=_map_checkpoint_name,
++        )
++
++
++def test_ple_ssd_store_rejects_wrong_shard_shape(tmp_path: Path) -> None:
++    _write_checkpoint(
++        tmp_path,
++        [
++            torch.zeros(3, 2, dtype=torch.float8_e4m3fn),
++            torch.zeros(1, 2, dtype=torch.float8_e4m3fn),
++        ],
++    )
++
++    with pytest.raises(ValueError, match="shape mismatch"):
++        SafetensorsPleStore(
++            tmp_path,
++            "ple",
++            expected_parts=2,
++            expected_vocab_size=4,
++            expected_width=2,
++            name_mapper=_map_checkpoint_name,
++        )
++
++
++def test_ssd_embedding_allocates_only_scale_parameter(tmp_path: Path) -> None:
++    shards = [
++        torch.zeros(2, 2, dtype=torch.float8_e4m3fn),
++        torch.ones(2, 2, dtype=torch.float8_e4m3fn),
++    ]
++    _write_checkpoint(tmp_path, shards)
++    embedding = SsdBackedPleEmbedding(4, 2, 2)
++
++    embedding.configure(
++        tmp_path,
++        "ple",
++        name_mapper=_map_checkpoint_name,
++        drop_cache=False,
++    )
++
++    parameters = dict(embedding.named_parameters())
++    assert set(parameters) == {"weight_scale"}
++    assert parameters["weight_scale"].numel() == 1
++
++
++def test_ple_ssd_weight_filter_only_skips_embedding_shards(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.setattr(weight_utils.envs, "VLLM_PLE_SSD_OFFLOAD", True)
++
++    assert weight_utils.should_skip_ple_ssd_weight(
++        "model.layers.1.ple.ple_embedding.ngram_embedding.shard_42.weight"
++    )
++    assert not weight_utils.should_skip_ple_ssd_weight(
++        "model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale"
++    )
++    assert not weight_utils.should_skip_ple_ssd_weight(
++        "model.layers.1.mlp.experts.42.down_proj.weight"
++    )
+diff --git a/vllm/model_executor/layers/ple_ssd_store.py b/vllm/model_executor/layers/ple_ssd_store.py
+new file mode 100644
+index 0000000000..593c0b9050
+--- /dev/null
++++ b/vllm/model_executor/layers/ple_ssd_store.py
+@@ -0,0 +1,417 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""SSD-backed safetensors row lookup for large PLE embedding tables."""
++
++import json
++import mmap
++import os
++import struct
++from collections.abc import Callable
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any
++
++import torch
++from torch import nn
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++_SAFETENSORS_INDEX = "model.safetensors.index.json"
++_FP8_DTYPE = "F8_E4M3"
++
++
++@dataclass(frozen=True)
++class _ShardMetadata:
++    index: int
++    checkpoint_name: str
++    file_path: Path
++    data_offset: int
++    rows: int
++    width: int
++
++
++class _MappedSafetensorsFile:
++    """One private, file-backed mmap shared by every tensor in a shard file."""
++
++    def __init__(self, path: Path) -> None:
++        self.path = path
++        self._file = path.open("rb")
++        self.mapping = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_COPY)
++        if hasattr(self.mapping, "madvise") and hasattr(mmap, "MADV_RANDOM"):
++            self.mapping.madvise(mmap.MADV_RANDOM)
++
++    def byte_tensor(self, offset: int, length: int) -> tuple[memoryview, torch.Tensor]:
++        view = memoryview(self.mapping)[offset : offset + length]
++        tensor = torch.frombuffer(view, dtype=torch.uint8)
++        return view, tensor
++
++    def drop_cache(self) -> None:
++        if hasattr(self.mapping, "madvise") and hasattr(mmap, "MADV_DONTNEED"):
++            self.mapping.madvise(mmap.MADV_DONTNEED)
++
++    def drop_cache_ranges(self, ranges: list[tuple[int, int]]) -> None:
++        """Discard only pages touched by small random row lookups."""
++        if (
++            not ranges
++            or not hasattr(self.mapping, "madvise")
++            or not hasattr(mmap, "MADV_DONTNEED")
++        ):
++            return
++
++        page_size = mmap.PAGESIZE
++        mapped_size = len(self.mapping)
++        page_ranges = sorted(
++            {
++                (
++                    (offset // page_size) * page_size,
++                    min(
++                        ((offset + length + page_size - 1) // page_size) * page_size,
++                        mapped_size,
++                    ),
++                )
++                for offset, length in ranges
++            }
++        )
++        merged: list[tuple[int, int]] = []
++        for start, end in page_ranges:
++            if not merged or start > merged[-1][1]:
++                merged.append((start, end))
++            else:
++                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
++        for start, end in merged:
++            if end > start:
++                self.mapping.madvise(mmap.MADV_DONTNEED, start, end - start)
++
++
++def _read_safetensors_header(path: Path) -> tuple[int, dict[str, Any]]:
++    with path.open("rb") as file:
++        raw_length = file.read(8)
++        if len(raw_length) != 8:
++            raise ValueError(f"Invalid safetensors header in {path}")
++        header_length = struct.unpack("<Q", raw_length)[0]
++        if header_length <= 0 or header_length > path.stat().st_size - 8:
++            raise ValueError(
++                f"Invalid safetensors header length {header_length} in {path}"
++            )
++        raw_header = file.read(header_length)
++    try:
++        header = json.loads(raw_header)
++    except (TypeError, ValueError) as error:
++        raise ValueError(f"Invalid safetensors JSON header in {path}") from error
++    if not isinstance(header, dict):
++        raise ValueError(f"Safetensors header in {path} is not an object")
++    return 8 + header_length, header
++
++
++class SafetensorsPleStore:
++    """Map checkpoint PLE shards without copying their complete contents to RAM."""
++
++    def __init__(
++        self,
++        checkpoint_dir: str | os.PathLike[str],
++        layer_prefix: str,
++        *,
++        expected_parts: int,
++        expected_vocab_size: int,
++        expected_width: int,
++        name_mapper: Callable[[str], str | None] | None = None,
++        drop_cache: bool = False,
++    ) -> None:
++        self.checkpoint_dir = Path(checkpoint_dir)
++        self.layer_prefix = layer_prefix
++        self.expected_parts = expected_parts
++        self.expected_vocab_size = expected_vocab_size
++        self.embedding_dim = expected_width
++        self.dtype = torch.float8_e4m3fn
++        self.drop_cache_after_lookup = drop_cache
++
++        if expected_parts <= 0:
++            raise ValueError("PLE SSD shard count must be positive")
++        if expected_vocab_size <= 0 or expected_width <= 0:
++            raise ValueError("PLE SSD table dimensions must be positive")
++
++        shards = self._discover_shards(name_mapper)
++        self.rows_per_shard = (expected_vocab_size + expected_parts - 1) // expected_parts
++        self._files: dict[Path, _MappedSafetensorsFile] = {}
++        self._views: list[memoryview] = []
++        self._tables: list[torch.Tensor] = []
++        self._table_file_paths: list[Path] = []
++        self._table_data_offsets: list[int] = []
++
++        for shard in shards:
++            mapped_file = self._files.get(shard.file_path)
++            if mapped_file is None:
++                mapped_file = _MappedSafetensorsFile(shard.file_path)
++                self._files[shard.file_path] = mapped_file
++            byte_length = shard.rows * shard.width
++            view, raw_table = mapped_file.byte_tensor(shard.data_offset, byte_length)
++            self._views.append(view)
++            self._tables.append(raw_table.reshape(shard.rows, shard.width))
++            self._table_file_paths.append(shard.file_path)
++            self._table_data_offsets.append(shard.data_offset)
++
++        self.mapped_bytes = sum(table.numel() for table in self._tables)
++        logger.info(
++            "Mapped %d PLE shard(s) from %d safetensors file(s): %.2f GiB "
++            "file-backed, no full-table RAM allocation",
++            len(self._tables),
++            len(self._files),
++            self.mapped_bytes / 1024**3,
++        )
++
++    def _discover_shards(
++        self,
++        name_mapper: Callable[[str], str | None] | None,
++    ) -> list[_ShardMetadata]:
++        index_path = self.checkpoint_dir / _SAFETENSORS_INDEX
++        if not index_path.is_file():
++            raise FileNotFoundError(
++                f"PLE SSD offload requires {index_path}; checkpoint is incomplete "
++                "or does not use an indexed safetensors layout"
++            )
++        with index_path.open(encoding="utf-8") as file:
++            index = json.load(file)
++        weight_map = index.get("weight_map")
++        if not isinstance(weight_map, dict):
++            raise ValueError(f"Invalid weight_map in {index_path}")
++
++        shard_prefix = f"{self.layer_prefix}.ngram_embedding.shard_"
++        checkpoint_entries: dict[int, tuple[str, Path]] = {}
++        for checkpoint_name, relative_file in weight_map.items():
++            if not isinstance(checkpoint_name, str) or not isinstance(relative_file, str):
++                continue
++            mapped_name = (
++                name_mapper(checkpoint_name) if name_mapper is not None else checkpoint_name
++            )
++            if mapped_name is None or not mapped_name.startswith(shard_prefix):
++                continue
++            suffix = mapped_name[len(shard_prefix) :]
++            if not suffix.endswith(".weight"):
++                continue
++            shard_text = suffix[: -len(".weight")]
++            if not shard_text.isdigit():
++                continue
++            shard_index = int(shard_text)
++            if shard_index in checkpoint_entries:
++                raise ValueError(f"Duplicate PLE SSD shard index {shard_index}")
++            checkpoint_entries[shard_index] = (
++                checkpoint_name,
++                self.checkpoint_dir / relative_file,
++            )
++
++        expected_indices = set(range(self.expected_parts))
++        found_indices = set(checkpoint_entries)
++        if found_indices != expected_indices:
++            missing = sorted(expected_indices - found_indices)
++            extra = sorted(found_indices - expected_indices)
++            raise ValueError(
++                "PLE SSD checkpoint shard set mismatch: "
++                f"missing={missing}, extra={extra}"
++            )
++
++        headers: dict[Path, tuple[int, dict[str, Any]]] = {}
++        rows_per_shard = (
++            self.expected_vocab_size + self.expected_parts - 1
++        ) // self.expected_parts
++        shards: list[_ShardMetadata] = []
++        for shard_index in range(self.expected_parts):
++            checkpoint_name, file_path = checkpoint_entries[shard_index]
++            if not file_path.is_file():
++                raise FileNotFoundError(
++                    f"PLE SSD shard file is missing for {checkpoint_name}: {file_path}"
++                )
++            if file_path not in headers:
++                headers[file_path] = _read_safetensors_header(file_path)
++            data_base, header = headers[file_path]
++            tensor_info = header.get(checkpoint_name)
++            if not isinstance(tensor_info, dict):
++                raise ValueError(f"Tensor {checkpoint_name} is absent from {file_path}")
++            dtype = tensor_info.get("dtype")
++            shape = tensor_info.get("shape")
++            offsets = tensor_info.get("data_offsets")
++            if dtype != _FP8_DTYPE:
++                raise ValueError(
++                    f"PLE SSD tensor {checkpoint_name} must use {_FP8_DTYPE}, got {dtype}"
++                )
++            if (
++                not isinstance(shape, list)
++                or len(shape) != 2
++                or not all(isinstance(value, int) for value in shape)
++            ):
++                raise ValueError(f"Invalid PLE SSD shape for {checkpoint_name}: {shape}")
++            expected_rows = max(
++                0,
++                min(
++                    rows_per_shard,
++                    self.expected_vocab_size - shard_index * rows_per_shard,
++                ),
++            )
++            expected_shape = [expected_rows, self.embedding_dim]
++            if shape != expected_shape:
++                raise ValueError(
++                    f"PLE SSD shape mismatch for {checkpoint_name}: "
++                    f"expected {expected_shape}, got {shape}"
++                )
++            if (
++                not isinstance(offsets, list)
++                or len(offsets) != 2
++                or not all(isinstance(value, int) for value in offsets)
++            ):
++                raise ValueError(
++                    f"Invalid PLE SSD data offsets for {checkpoint_name}: {offsets}"
++                )
++            relative_start, relative_end = offsets
++            expected_bytes = expected_rows * self.embedding_dim
++            if relative_start < 0 or relative_end - relative_start != expected_bytes:
++                raise ValueError(
++                    f"PLE SSD byte length mismatch for {checkpoint_name}: "
++                    f"expected {expected_bytes}, got {relative_end - relative_start}"
++                )
++            absolute_end = data_base + relative_end
++            if absolute_end > file_path.stat().st_size:
++                raise ValueError(
++                    f"PLE SSD tensor {checkpoint_name} extends past {file_path}"
++                )
++            shards.append(
++                _ShardMetadata(
++                    index=shard_index,
++                    checkpoint_name=checkpoint_name,
++                    file_path=file_path,
++                    data_offset=data_base + relative_start,
++                    rows=expected_rows,
++                    width=self.embedding_dim,
++                )
++            )
++        return shards
++
++    @torch.inference_mode()
++    def lookup(
++        self,
++        indices: torch.Tensor,
++        *,
++        out: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """Gather FP8 rows while touching only the referenced file-backed pages."""
++        if indices.device.type != "cpu":
++            raise ValueError("PLE SSD indices must be on CPU")
++        flat_indices = indices.reshape(-1).to(dtype=torch.long)
++        row_count = flat_indices.numel()
++        expected_shape = (row_count, self.embedding_dim)
++        if out is None:
++            output = torch.empty(expected_shape, dtype=self.dtype)
++        else:
++            if out.device.type != "cpu" or out.dtype != self.dtype:
++                raise ValueError(
++                    f"PLE SSD output must be a CPU {self.dtype} tensor, got "
++                    f"{out.device}/{out.dtype}"
++                )
++            if out.numel() < row_count * self.embedding_dim:
++                raise ValueError(
++                    f"PLE SSD output has {out.numel()} elements, needs "
++                    f"{row_count * self.embedding_dim}"
++                )
++            output = out.reshape(-1)[: row_count * self.embedding_dim].reshape(
++                expected_shape
++            )
++        if row_count == 0:
++            return output
++
++        minimum = int(flat_indices.min().item())
++        maximum = int(flat_indices.max().item())
++        if minimum < 0 or maximum >= self.expected_vocab_size:
++            raise IndexError(
++                f"PLE SSD row index outside [0, {self.expected_vocab_size}): "
++                f"min={minimum}, max={maximum}"
++            )
++
++        output_bytes = output.view(torch.uint8)
++        shard_ids = torch.div(
++            flat_indices, self.rows_per_shard, rounding_mode="floor"
++        )
++        order = torch.argsort(shard_ids)
++        sorted_shard_ids = shard_ids.index_select(0, order)
++        unique_shards, counts = torch.unique_consecutive(
++            sorted_shard_ids, return_counts=True
++        )
++        used_files: set[Path] = set()
++        touched_ranges: dict[Path, list[tuple[int, int]]] = {}
++        use_precise_drop = self.drop_cache_after_lookup and row_count <= 1024
++        cursor = 0
++        for shard_index, count in zip(
++            unique_shards.tolist(), counts.tolist(), strict=True
++        ):
++            end = cursor + count
++            output_positions = order[cursor:end]
++            local_rows = flat_indices.index_select(0, output_positions)
++            local_rows.sub_(shard_index * self.rows_per_shard)
++            selected = self._tables[shard_index].index_select(0, local_rows)
++            output_bytes.index_copy_(0, output_positions, selected)
++            file_path = self._table_file_paths[shard_index]
++            used_files.add(file_path)
++            if use_precise_drop:
++                data_offset = self._table_data_offsets[shard_index]
++                touched_ranges.setdefault(file_path, []).extend(
++                    (data_offset + row * self.embedding_dim, self.embedding_dim)
++                    for row in local_rows.tolist()
++                )
++            cursor = end
++
++        if self.drop_cache_after_lookup:
++            if use_precise_drop:
++                for path, ranges in touched_ranges.items():
++                    self._files[path].drop_cache_ranges(ranges)
++            else:
++                for path in used_files:
++                    self._files[path].drop_cache()
++        return output
++
++
++class SsdBackedPleEmbedding(nn.Module):
++    """Weightless embedding placeholder configured after model discovery."""
++
++    def __init__(
++        self,
++        vocab_size: int,
++        embedding_dim: int,
++        split_parts: int,
++    ) -> None:
++        super().__init__()
++        self.org_vocab_size = vocab_size
++        self.embedding_dim = embedding_dim
++        self.split_parts = split_parts
++        self.register_parameter(
++            "weight_scale",
++            nn.Parameter(torch.ones(1, dtype=torch.bfloat16), requires_grad=False),
++        )
++        self._store: SafetensorsPleStore | None = None
++
++    def configure(
++        self,
++        checkpoint_dir: str | os.PathLike[str],
++        layer_prefix: str,
++        *,
++        name_mapper: Callable[[str], str | None] | None,
++        drop_cache: bool,
++    ) -> None:
++        if self._store is not None:
++            raise RuntimeError("PLE SSD embedding is already configured")
++        self._store = SafetensorsPleStore(
++            checkpoint_dir,
++            layer_prefix,
++            expected_parts=self.split_parts,
++            expected_vocab_size=self.org_vocab_size,
++            expected_width=self.embedding_dim,
++            name_mapper=name_mapper,
++            drop_cache=drop_cache,
++        )
++
++    @property
++    def storage_dtype(self) -> torch.dtype:
++        return torch.float8_e4m3fn
++
++    def lookup(self, indices: torch.Tensor, *, out: torch.Tensor) -> torch.Tensor:
++        if self._store is None:
++            raise RuntimeError("PLE SSD embedding was used before checkpoint mapping")
++        return self._store.lookup(indices, out=out)

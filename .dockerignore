@@ -1,0 +1,5 @@
+*.oci.tar
+*.oci
+*.oci/
+*.building-*
+*.tmp

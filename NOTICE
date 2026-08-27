@@ -1,0 +1,13 @@
+Qwen3.8 Flash Next vLLM image for NVIDIA DGX Spark / ASUS Ascent GX10
+
+This image is derived from vLLM commit
+f561eca6ca4f3f79808a696b1521cb76dc8aafa2 and contains local modifications
+for Qwen3.8 Flash Next SSD-backed PLE execution and GB10 decode tuning.
+
+This software contains source code provided by NVIDIA Corporation.
+
+The vLLM source and local modifications are provided under Apache-2.0. The
+container also includes NVIDIA CUDA and other components governed by their own
+licenses. See the bundled license files and the license metadata installed by
+individual packages. Model weights are not included in this image and retain
+their own separate license when mounted at runtime.
